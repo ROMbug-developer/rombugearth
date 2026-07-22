@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.manifest
+
+# Distributables — these belong in GitHub Releases, not the repo
+*.exe
+*.zip
+
+# Local databases — licence data lives on the Render disk
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets — never commit these
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
