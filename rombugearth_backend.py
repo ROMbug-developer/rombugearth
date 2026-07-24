@@ -251,6 +251,10 @@ def checkout():
             payment_method_types=["card"],
             line_items=[{"price": PRICE_ID, "quantity": 1}],
             customer_email=email,
+            # Shows the "Add promotion code" box on Stripe's hosted page, so a
+            # 100%-off coupon can be redeemed. Platform-agnostic: the Windows
+            # and Linux apps both just open the URL this endpoint returns.
+            allow_promotion_codes=True,
             metadata={"product": "rombugearth_vpn", "email": email},
             success_url=f"{PUBLIC_URL}/paid?ok=1",
             cancel_url=f"{PUBLIC_URL}/paid?ok=0",
