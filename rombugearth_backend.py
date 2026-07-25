@@ -831,9 +831,19 @@ def _core(ip):
     if not hosting and not d.get("hosting"):
         hosting = _looks_like_hosting(org, as_domain)
 
+    lat = lon = None
+    loc = (d.get("loc") or "").split(",")
+    if len(loc) == 2:
+        try:
+            lat, lon = float(loc[0]), float(loc[1])
+        except ValueError:
+            lat = lon = None
+
     return {
         "city": d.get("city") or "",
         "region": d.get("region") or "",
+        "lat": lat,
+        "lon": lon,
         "country": d.get("country") or "",
         "country_code": d.get("country") or "",
         "continent": "",
@@ -871,6 +881,30 @@ def _ptr(ip):
         return ""
 
 
+# Reverse-DNS fingerprints for mobile carriers. On a cellular connection the
+# address belongs to a gateway shared by thousands of subscribers, so the city
+# it maps to is the gateway's, not the visitor's.
+_MOBILE_DOMAINS = (
+    "myvzw.com", "vzwinternet.com", "mycingular.net", "attwireless.net",
+    "t-mobile.com", "tmodns.net", "spcsdns.net", "sprintpcs.com", "uscc.net",
+    "rogers.com", "telus.net", "bell.ca", "vodafone", "o2.co.uk", "ee.co.uk",
+    "three.co.uk", "orange.fr", "telefonica", "claro", "telcel",
+)
+_MOBILE_TOKENS = {
+    "mobile", "wireless", "cellular", "cell", "lte", "gprs", "umts", "gsm",
+    "3g", "4g", "5g", "wwan",
+}
+
+
+def _looks_mobile(hostname):
+    h = (hostname or "").lower()
+    if not h:
+        return False
+    if any(d in h for d in _MOBILE_DOMAINS):
+        return True
+    return any(part in _MOBILE_TOKENS for part in re.split(r"[.\-_]", h))
+
+
 def _provider_from_host(hostname):
     """Turn 'cpc1-brig21.cable.virginm.net' into 'virginm.net'."""
     parts = [p for p in (hostname or "").split(".") if p]
@@ -898,10 +932,13 @@ def _freeipapi(ip):
     host = _ptr(ip)
     provider = _provider_from_host(host)
     proxy = bool(d.get("isProxy"))
+    mobile = _looks_mobile(host)
 
     return {
         "city": d.get("cityName") or "",
         "region": d.get("regionName") or "",
+        "lat": d.get("latitude"),
+        "lon": d.get("longitude"),
         "country": d.get("countryName") or "",
         "country_code": d.get("countryCode") or "",
         "continent": d.get("continent") or "",
@@ -912,7 +949,8 @@ def _freeipapi(ip):
         "tz_offset": _parse_offset(d.get("timeZone")),
         "hosting": proxy or _looks_like_hosting(host, provider),
         "anonymous": proxy,
-        "precision": "city",
+        "mobile": mobile,
+        "precision": "carrier" if mobile else "city",
         "attribution": "freeipapi.com",
     }
 
