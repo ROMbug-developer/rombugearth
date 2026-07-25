@@ -43,6 +43,8 @@ import os
 import json
 import secrets
 import sqlite3
+import time
+import ipaddress
 import datetime as dt
 
 import stripe
@@ -658,6 +660,237 @@ def config():
     except Exception as e:
         return jsonify(error=f"Could not fetch config: {e}"), 502
     return jsonify(config=conf)
+
+
+# ── free privacy test ───────────────────────────────────────────────────
+#
+# Backs the public page at rombugearth.com/privacy-check. That page reads
+# almost everything from the browser itself, but a browser cannot see its
+# own public address, so this route reports the address the request arrived
+# from plus a geo/ASN lookup.
+#
+# Deliberately: nothing is written to the database, nothing is logged, and
+# the only retention is a ten-minute in-memory cache to keep the ipinfo
+# quota down. Gunicorn writes no access log unless you pass
+# --access-logfile, so leave that flag off and the page's "we don't save
+# your results" line stays true.
+#
+# Environment variables
+#   IPINFO_TOKEN       required. Free Lite token: ipinfo.io/dashboard/lite
+#   IPINFO_PLAN        "lite" (default) or "core" if you upgrade to a paid plan
+#   PRIVACY_ORIGINS    comma-separated origins allowed to call this route
+#   CLIENT_IP_HEADER   set to e.g. CF-Connecting-IP if a CDN fronts Render
+#
+# Lite is free with unlimited requests but returns country and ASN only —
+# no city, region or time zone — and IPinfo require visible attribution
+# when the data is shown publicly. The page carries that credit in its
+# footer; don't remove it. Set IPINFO_PLAN=core on a paid token and the
+# city and time-zone rows light up on their own.
+
+PRIVACY_ORIGINS = {
+    o.strip().rstrip("/")
+    for o in os.getenv(
+        "PRIVACY_ORIGINS",
+        "https://www.rombugearth.com,https://rombugearth.com,"
+        "http://localhost:8888,http://127.0.0.1:8888",
+    ).split(",")
+    if o.strip()
+}
+IPINFO_TOKEN = os.getenv("IPINFO_TOKEN", "")
+IPINFO_PLAN = os.getenv("IPINFO_PLAN", "lite").strip().lower()
+CLIENT_IP_HEADER = os.getenv("CLIENT_IP_HEADER", "").strip()
+
+GEO_TTL = 600          # seconds to keep a lookup in memory
+RATE_MAX = 20          # requests per address per window
+RATE_WINDOW = 60
+
+_geo_cache = {}        # ip -> (expires_at, payload)
+_rate = {}             # ip -> [timestamps]
+
+# Substrings that mean "datacentre, hosting or VPN" rather than "a house".
+_HOSTING_WORDS = (
+    "hosting", "host", "datacenter", "datacentre", "data center", "cloud",
+    "server", "colo", "vpn", "proxy", "digitalocean", "linode", "vultr",
+    "ovh", "hetzner", "amazon", "aws", "google llc", "google cloud",
+    "microsoft", "azure", "oracle", "cloudflare", "leaseweb", "choopa",
+    "contabo", "scaleway", "m247", "datacamp", "packethub", "nforce",
+    "quadranet", "psychz", "zenlayer", "hostwinds", "ipxo", "clouvider",
+)
+
+
+def _privacy_cors(resp):
+    """Allow only our own front end to read this route."""
+    origin = (request.headers.get("Origin") or "").rstrip("/")
+    if origin in PRIVACY_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "600"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _client_ip():
+    """
+    The address this request actually came from.
+
+    Render appends the real client to whatever X-Forwarded-For the caller
+    sent, so the LAST hop is the trustworthy one. If you put a CDN in front
+    of Render, set CLIENT_IP_HEADER to the header it provides instead —
+    don't trust those headers by default, since a visitor can forge them.
+    """
+    if CLIENT_IP_HEADER:
+        v = (request.headers.get(CLIENT_IP_HEADER) or "").strip()
+        if v:
+            return v.split(",")[0].strip()
+    xff = request.headers.get("X-Forwarded-For", "")
+    hops = [p.strip() for p in xff.split(",") if p.strip()]
+    if hops:
+        return hops[-1]
+    return request.remote_addr or ""
+
+
+def _rate_ok(ip):
+    now_ts = time.time()
+    hits = [t for t in _rate.get(ip, []) if now_ts - t < RATE_WINDOW]
+    hits.append(now_ts)
+    _rate[ip] = hits
+    if len(_rate) > 5000:          # crude cap so this can't grow unbounded
+        _rate.clear()
+    return len(hits) <= RATE_MAX
+
+
+def _looks_like_hosting(*names):
+    low = " ".join(n or "" for n in names).lower()
+    return any(w in low for w in _HOSTING_WORDS)
+
+
+def _lite(ip):
+    """
+    IPinfo Lite: free, unlimited, token required.
+    Returns country + continent + ASN only — no city, region or time zone.
+    https://api.ipinfo.io/lite/<ip>?token=...
+    """
+    r = requests.get(f"https://api.ipinfo.io/lite/{ip}",
+                     params={"token": IPINFO_TOKEN}, timeout=6,
+                     headers={"Accept": "application/json"})
+    if r.status_code != 200:
+        return {}
+    d = r.json()
+    return {
+        "city": "",
+        "region": "",
+        "country": d.get("country") or "",
+        "country_code": d.get("country_code") or "",
+        "continent": d.get("continent") or "",
+        "org": d.get("as_name") or "",
+        "asn": d.get("asn") or "",
+        "as_domain": d.get("as_domain") or "",
+        "timezone": "",
+        "hosting": _looks_like_hosting(d.get("as_name"), d.get("as_domain")),
+        "precision": "country",
+        "attribution": "IPinfo Lite",
+    }
+
+
+def _core(ip):
+    """
+    IPinfo Core (paid): adds city, region, time zone and authoritative
+    hosting/anonymous flags. Only used when IPINFO_PLAN=core.
+    """
+    r = requests.get(f"https://ipinfo.io/{ip}/json",
+                     params={"token": IPINFO_TOKEN}, timeout=6,
+                     headers={"Accept": "application/json"})
+    if r.status_code != 200:
+        return {}
+    d = r.json()
+
+    # Core nests ASN data; the older flat shape puts it in org as "AS123 Name".
+    asn_obj = d.get("asn")
+    if isinstance(asn_obj, dict):
+        asn = asn_obj.get("asn") or ""
+        org = asn_obj.get("name") or ""
+        as_domain = asn_obj.get("domain") or ""
+        as_type = (asn_obj.get("type") or "").lower()
+    else:
+        asn, as_domain, as_type = "", "", ""
+        org = (d.get("org") or "").strip()
+        if org.startswith("AS"):
+            bits = org.split(" ", 1)
+            asn = bits[0]
+            org = bits[1] if len(bits) > 1 else ""
+
+    # Prefer IPinfo's own flags where the plan supplies them.
+    hosting = bool(d.get("hosting")) or as_type == "hosting"
+    if not hosting and not d.get("hosting"):
+        hosting = _looks_like_hosting(org, as_domain)
+
+    return {
+        "city": d.get("city") or "",
+        "region": d.get("region") or "",
+        "country": d.get("country") or "",
+        "country_code": d.get("country") or "",
+        "continent": "",
+        "org": org,
+        "asn": asn,
+        "as_domain": as_domain,
+        "timezone": d.get("timezone") or "",
+        "hosting": hosting,
+        "anonymous": bool(d.get("anonymous") or d.get("vpn") or d.get("proxy")),
+        "precision": "city",
+        "attribution": "IPinfo",
+    }
+
+
+def _geo(ip):
+    """Look the address up, with a short in-memory cache. {} on any failure."""
+    now_ts = time.time()
+    hit = _geo_cache.get(ip)
+    if hit and hit[0] > now_ts:
+        return hit[1]
+
+    out = {}
+    if IPINFO_TOKEN:
+        try:
+            out = _core(ip) if IPINFO_PLAN == "core" else _lite(ip)
+        except Exception:
+            out = {}
+
+    if len(_geo_cache) > 2000:
+        _geo_cache.clear()
+    _geo_cache[ip] = (now_ts + GEO_TTL, out)
+    return out
+
+
+@app.route("/privacy/check", methods=["GET", "OPTIONS"])
+def privacy_check():
+    if request.method == "OPTIONS":
+        return _privacy_cors(app.make_default_options_response())
+
+    ip = _client_ip()
+    try:
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return _privacy_cors(jsonify(ok=False,
+                                     error="Couldn't read your address.")), 400
+
+    if not _rate_ok(ip):
+        return _privacy_cors(jsonify(ok=False,
+                                     error="Too many tests. Try again in a minute.")), 429
+
+    body = {"ok": True, "ip": ip, "version": parsed.version,
+            "precision": "none", "plan": IPINFO_PLAN}
+    if parsed.is_private or parsed.is_loopback:
+        body.update(city="", region="", country="", org="Private network",
+                    asn="", timezone="", hosting=False, local=True)
+    elif not IPINFO_TOKEN:
+        # No token configured: still report the address, say why the rest is blank.
+        body.update(city="", region="", country="", org="", asn="",
+                    timezone="", hosting=False,
+                    note="Address lookup isn't configured on this server.")
+    else:
+        body.update(_geo(ip))
+    return _privacy_cors(jsonify(**body))
 
 
 if __name__ == "__main__":
