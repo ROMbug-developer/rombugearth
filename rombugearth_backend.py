@@ -30,7 +30,7 @@ VPNR_TOKEN                 VPNresellers reseller API bearer token
 VPNR_PROJECT_ID            a project id created once in your VPNresellers panel
 RESEND_API_KEY             (optional) to email licence keys; reuse Floor113's
 MAIL_FROM                  e.g. "ROMbug Earth <noreply@rombug.com>"
-PUBLIC_URL                 this service's own URL, e.g. https://atlasvpn-api.onrender.com
+PUBLIC_URL                 this service's own URL, e.g. https://rombugearth-api.onrender.com
 DATABASE_PATH              (optional) sqlite path, defaults to ./atlas.db
 
 Deploy on Render exactly like your other backends:
@@ -41,11 +41,14 @@ Deploy on Render exactly like your other backends:
 
 import os
 import json
+import re
+import socket
 import secrets
 import sqlite3
 import time
 import ipaddress
 import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 
 import stripe
 import requests
@@ -675,17 +678,18 @@ def config():
 # --access-logfile, so leave that flag off and the page's "we don't save
 # your results" line stays true.
 #
-# Environment variables
-#   IPINFO_TOKEN       required. Free Lite token: ipinfo.io/dashboard/lite
-#   IPINFO_PLAN        "lite" (default) or "core" if you upgrade to a paid plan
+# Environment variables (all optional — the defaults work with no signup)
+#   GEO_PROVIDER       "freeipapi" (default), "ipinfo-lite" or "ipinfo-core"
+#   IPINFO_TOKEN       only needed for the two ipinfo providers
 #   PRIVACY_ORIGINS    comma-separated origins allowed to call this route
 #   CLIENT_IP_HEADER   set to e.g. CF-Connecting-IP if a CDN fronts Render
+#   REVERSE_DNS        "1" (default) to look up the visitor's PTR record
 #
-# Lite is free with unlimited requests but returns country and ASN only —
-# no city, region or time zone — and IPinfo require visible attribution
-# when the data is shown publicly. The page carries that credit in its
-# footer; don't remove it. Set IPINFO_PLAN=core on a paid token and the
-# city and time-zone rows light up on their own.
+# freeipapi needs no account and no key, and its terms allow commercial use
+# at 60 requests a minute. It returns city, region and a UTC offset but no
+# ASN or ISP name, so the provider row is filled from the address's own
+# reverse-DNS record instead — the same thing any web server's logs see,
+# fetched without telling a third party who asked.
 
 PRIVACY_ORIGINS = {
     o.strip().rstrip("/")
@@ -696,14 +700,16 @@ PRIVACY_ORIGINS = {
     ).split(",")
     if o.strip()
 }
+GEO_PROVIDER = os.getenv("GEO_PROVIDER", "freeipapi").strip().lower()
 IPINFO_TOKEN = os.getenv("IPINFO_TOKEN", "")
-IPINFO_PLAN = os.getenv("IPINFO_PLAN", "lite").strip().lower()
 CLIENT_IP_HEADER = os.getenv("CLIENT_IP_HEADER", "").strip()
+REVERSE_DNS = os.getenv("REVERSE_DNS", "1") != "0"
 
 GEO_TTL = 600          # seconds to keep a lookup in memory
 RATE_MAX = 20          # requests per address per window
 RATE_WINDOW = 60
 
+_dns_pool = ThreadPoolExecutor(max_workers=4)   # reverse-DNS lookups only
 _geo_cache = {}        # ip -> (expires_at, payload)
 _rate = {}             # ip -> [timestamps]
 
@@ -842,6 +848,75 @@ def _core(ip):
     }
 
 
+def _parse_offset(txt):
+    """freeipapi gives a UTC offset like '+02:00'. Return it in minutes."""
+    m = re.match(r"^([+-])(\d{1,2}):(\d{2})$", (txt or "").strip())
+    if not m:
+        return None
+    mins = int(m.group(2)) * 60 + int(m.group(3))
+    return -mins if m.group(1) == "-" else mins
+
+
+def _ptr(ip):
+    """
+    The address's reverse-DNS name, e.g. a cable or fibre customer record.
+    Run on a worker thread because gethostbyaddr has no timeout of its own
+    and a slow resolver would otherwise tie up the request.
+    """
+    if not REVERSE_DNS:
+        return ""
+    try:
+        return _dns_pool.submit(socket.gethostbyaddr, ip).result(timeout=2.0)[0]
+    except Exception:
+        return ""
+
+
+def _provider_from_host(hostname):
+    """Turn 'cpc1-brig21.cable.virginm.net' into 'virginm.net'."""
+    parts = [p for p in (hostname or "").split(".") if p]
+    if len(parts) < 2:
+        return ""
+    tail = parts[-2:]
+    # keep three labels for two-part suffixes like .co.uk or .com.au
+    if len(parts) >= 3 and len(parts[-2]) <= 3 and len(parts[-1]) <= 3:
+        tail = parts[-3:]
+    return ".".join(tail)
+
+
+def _freeipapi(ip):
+    """
+    freeipapi.com: no key, no account, commercial use allowed, 60 req/min.
+    Gives city, region, country, a UTC offset and a proxy flag — but no ASN,
+    so the provider comes from reverse DNS.
+    """
+    r = requests.get(f"https://free.freeipapi.com/api/json/{ip}", timeout=6,
+                     headers={"Accept": "application/json"})
+    if r.status_code != 200:
+        return {}
+    d = r.json()
+
+    host = _ptr(ip)
+    provider = _provider_from_host(host)
+    proxy = bool(d.get("isProxy"))
+
+    return {
+        "city": d.get("cityName") or "",
+        "region": d.get("regionName") or "",
+        "country": d.get("countryName") or "",
+        "country_code": d.get("countryCode") or "",
+        "continent": d.get("continent") or "",
+        "org": provider,
+        "asn": "",
+        "hostname": host,
+        "timezone": d.get("timeZone") or "",
+        "tz_offset": _parse_offset(d.get("timeZone")),
+        "hosting": proxy or _looks_like_hosting(host, provider),
+        "anonymous": proxy,
+        "precision": "city",
+        "attribution": "freeipapi.com",
+    }
+
+
 def _geo(ip):
     """Look the address up, with a short in-memory cache. {} on any failure."""
     now_ts = time.time()
@@ -850,11 +925,15 @@ def _geo(ip):
         return hit[1]
 
     out = {}
-    if IPINFO_TOKEN:
-        try:
-            out = _core(ip) if IPINFO_PLAN == "core" else _lite(ip)
-        except Exception:
-            out = {}
+    try:
+        if GEO_PROVIDER == "ipinfo-core" and IPINFO_TOKEN:
+            out = _core(ip)
+        elif GEO_PROVIDER == "ipinfo-lite" and IPINFO_TOKEN:
+            out = _lite(ip)
+        else:
+            out = _freeipapi(ip)
+    except Exception:
+        out = {}
 
     if len(_geo_cache) > 2000:
         _geo_cache.clear()
@@ -879,17 +958,18 @@ def privacy_check():
                                      error="Too many tests. Try again in a minute.")), 429
 
     body = {"ok": True, "ip": ip, "version": parsed.version,
-            "precision": "none", "plan": IPINFO_PLAN}
+            "precision": "none", "provider": GEO_PROVIDER}
     if parsed.is_private or parsed.is_loopback:
         body.update(city="", region="", country="", org="Private network",
                     asn="", timezone="", hosting=False, local=True)
-    elif not IPINFO_TOKEN:
-        # No token configured: still report the address, say why the rest is blank.
-        body.update(city="", region="", country="", org="", asn="",
-                    timezone="", hosting=False,
-                    note="Address lookup isn't configured on this server.")
     else:
-        body.update(_geo(ip))
+        got = _geo(ip)
+        if got:
+            body.update(got)
+        else:
+            body.update(city="", region="", country="", org="", asn="",
+                        timezone="", hosting=False,
+                        note="The address lookup didn't answer.")
     return _privacy_cors(jsonify(**body))
 
 
