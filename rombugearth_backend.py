@@ -709,9 +709,20 @@ GEO_TTL = 600          # seconds to keep a lookup in memory
 RATE_MAX = 20          # requests per address per window
 RATE_WINDOW = 60
 
+# The Tor Project publishes the authoritative list of every exit relay's
+# address. An IP on this list is definitively a Tor exit — the one privacy
+# signal we can state as fact rather than infer. Refreshed hourly; if the
+# fetch fails we keep the last good copy rather than losing detection.
+TOR_ENABLED = os.getenv("TOR_DETECT", "1") != "0"
+TOR_LIST_URL = os.getenv(
+    "TOR_LIST_URL", "https://check.torproject.org/torbulkexitlist")
+TOR_TTL = 3600         # seconds between refreshes of the exit list
+
 _dns_pool = ThreadPoolExecutor(max_workers=4)   # reverse-DNS lookups only
 _geo_cache = {}        # ip -> (expires_at, payload)
 _rate = {}             # ip -> [timestamps]
+_tor_exits = set()     # current exit-node addresses
+_tor_fetched_at = 0.0  # when _tor_exits was last successfully refreshed
 
 # Substrings that mean "datacentre, hosting or VPN" rather than "a house".
 _HOSTING_WORDS = (
@@ -955,6 +966,99 @@ def _freeipapi(ip):
     }
 
 
+def _refresh_tor_exits():
+    """
+    Pull the current Tor exit list, at most once per TOR_TTL.
+
+    On success the set is replaced atomically. On failure the previous set is
+    kept — a stale list still catches most exits, which is better than none —
+    and we simply try again on the next request after the interval.
+    """
+    global _tor_exits, _tor_fetched_at
+    if not TOR_ENABLED:
+        return
+    now_ts = time.time()
+    if _tor_exits and now_ts - _tor_fetched_at < TOR_TTL:
+        return
+    # Avoid hammering the source if it's down: back off by advancing the
+    # timestamp even on failure, so retries are spaced by TOR_TTL too.
+    _tor_fetched_at = now_ts
+    try:
+        r = requests.get(TOR_LIST_URL, timeout=6,
+                         headers={"Accept": "text/plain"})
+        if r.status_code != 200:
+            return
+        fresh = set()
+        for line in r.text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                fresh.add(str(ipaddress.ip_address(line)))
+            except ValueError:
+                continue
+        if fresh:
+            _tor_exits = fresh
+    except Exception:
+        # Keep whatever we had; detection degrades, it doesn't break.
+        pass
+
+
+def _is_tor_exit(ip):
+    """True if this address is a known Tor exit node."""
+    if not TOR_ENABLED:
+        return False
+    _refresh_tor_exits()
+    return ip in _tor_exits
+
+
+def _classify(ip, geo):
+    """
+    Turn the raw signals into one plain verdict for the front end.
+
+    Order matters: Tor is definitive and takes precedence, then an explicit
+    anonymous/proxy flag from the geo provider, then a datacentre ASN, which
+    is the weakest (a commercial VPN, but also just a cloud-hosted service).
+    Everything returned here is either fact (Tor) or clearly-labelled
+    inference, so the UI can be honest about confidence.
+    """
+    if _is_tor_exit(ip):
+        return {
+            "type": "tor",
+            "label": "Tor exit node",
+            "detail": "This address is a published Tor exit relay. Your "
+                      "traffic is leaving the Tor network here.",
+            "confidence": "certain",
+            "anonymised": True,
+        }
+    if geo.get("anonymous"):
+        return {
+            "type": "vpn",
+            "label": "VPN or proxy",
+            "detail": "This address is flagged as an anonymising VPN or "
+                      "proxy. Your real address is hidden behind it.",
+            "confidence": "high",
+            "anonymised": True,
+        }
+    if geo.get("hosting"):
+        return {
+            "type": "hosting",
+            "label": "Datacentre / hosting",
+            "detail": "This address belongs to a datacentre, not a home or "
+                      "mobile ISP — typical of a VPN, proxy or cloud service.",
+            "confidence": "medium",
+            "anonymised": True,
+        }
+    return {
+        "type": "none",
+        "label": "Direct connection",
+        "detail": "This looks like an ordinary consumer connection. No VPN, "
+                  "proxy or Tor was detected — your ISP can see your address.",
+        "confidence": "medium",
+        "anonymised": False,
+    }
+
+
 def _geo(ip):
     """Look the address up, with a short in-memory cache. {} on any failure."""
     now_ts = time.time()
@@ -1000,6 +1104,14 @@ def privacy_check():
     if parsed.is_private or parsed.is_loopback:
         body.update(city="", region="", country="", org="Private network",
                     asn="", timezone="", hosting=False, local=True)
+        # A private/loopback address can't be Tor or a VPN exit, and no
+        # public lookup applies — say so plainly instead of guessing.
+        body["detection"] = {
+            "type": "local", "label": "Local address",
+            "detail": "This is a private or loopback address, not a public "
+                      "one, so there's nothing to look up.",
+            "confidence": "certain", "anonymised": False,
+        }
     else:
         got = _geo(ip)
         if got:
@@ -1008,6 +1120,9 @@ def privacy_check():
             body.update(city="", region="", country="", org="", asn="",
                         timezone="", hosting=False,
                         note="The address lookup didn't answer.")
+        # Classify regardless of whether geo answered: the Tor check stands
+        # on its own, so a failed lookup still yields a definitive Tor verdict.
+        body["detection"] = _classify(ip, got or {})
     return _privacy_cors(jsonify(**body))
 
 
